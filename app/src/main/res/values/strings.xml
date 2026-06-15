@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">AndroidTools</string>
+    <string name="compile_shader">CompileGLSL</string>
+    <string name="compile_link_shader">CompileLinkGLSL</string>
+    <string name="compile_spirv">CompileLinkSpirv</string>
+</resources>
