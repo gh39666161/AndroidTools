@@ -107,6 +107,8 @@ const char *vkResultName(VkResult r) {
         case VK_ERROR_LAYER_NOT_PRESENT:        return "VK_ERROR_LAYER_NOT_PRESENT";
         case VK_ERROR_TOO_MANY_OBJECTS:         return "VK_ERROR_TOO_MANY_OBJECTS";
         case VK_ERROR_FORMAT_NOT_SUPPORTED:     return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL:          return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_UNKNOWN:                  return "VK_ERROR_UNKNOWN";
         default:                                return "VK_<other>";
     }
 }
@@ -159,6 +161,20 @@ VkShaderModule createShaderModuleFromWords(const std::vector<uint32_t> &code,
     log << "OK " << stageName << ": vkCreateShaderModule ("
         << code.size() << " words, " << (code.size() * 4) << " bytes)\n";
     return module;
+}
+
+// Human-readable name for the depth/stencil formats we may pick.
+const char *depthFormatName(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_D16_UNORM:           return "D16_UNORM";
+        case VK_FORMAT_D16_UNORM_S8_UINT:   return "D16_UNORM_S8_UINT";
+        case VK_FORMAT_D24_UNORM_S8_UINT:   return "D24_UNORM_S8_UINT";
+        case VK_FORMAT_D32_SFLOAT:          return "D32_SFLOAT";
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:  return "D32_SFLOAT_S8_UINT";
+        case VK_FORMAT_X8_D24_UNORM_PACK32: return "X8_D24_UNORM_PACK32";
+        case VK_FORMAT_S8_UINT:             return "S8_UINT";
+        default:                            return "UNKNOWN";
+    }
 }
 
 // Picks a depth (or depth/stencil) format the device supports as a depth-stencil
@@ -886,7 +902,7 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
                 << colorInputCount << " color)\n";
         }
         if (hasDepth) {
-            log << "depth attachment: format=" << depthFormat
+            log << "depth attachment: format=" << depthFormatName(depthFormat)
                 << " (also input=" << (depthInputCount > 0 ? "yes" : "no") << ")\n";
         }
 
@@ -1072,11 +1088,4 @@ JNIEXPORT jboolean JNICALL
 Java_com_zm_androidtools_VulkanContext_nativeIsInitialized(JNIEnv * /* env */, jobject /* this */) {
     return (g_vk.initialized && g_vk.device != VK_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
-
-JNIEXPORT jstring JNICALL
-Java_com_zm_androidtools_MainActivity_stringFromJNI(JNIEnv *env, jobject /* this */) {
-    std::string hello = "Hello from C++";
-    return env->NewStringUTF(hello.c_str());
-}
-
 } // extern "C"
