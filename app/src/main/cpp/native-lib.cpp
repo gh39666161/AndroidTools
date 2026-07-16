@@ -161,6 +161,28 @@ VkShaderModule createShaderModuleFromWords(const std::vector<uint32_t> &code,
     return module;
 }
 
+// Picks a depth (or depth/stencil) format the device supports as a depth-stencil
+// attachment. UE's SubpassDepthFetch path uses D24_UNORM_S8_UINT (format 129);
+// fall back through the common alternatives.
+VkFormat pickDepthStencilFormat() {
+    const VkFormat candidates[] = {
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D16_UNORM_S8_UINT,
+        VK_FORMAT_D16_UNORM,
+    };
+    for (VkFormat f : candidates) {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, f, &props);
+        if (props.optimalTilingFeatures &
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            return f;
+        }
+    }
+    return VK_FORMAT_D24_UNORM_S8_UINT; // last resort; may fail create
+}
+
 // Size in bytes of the vertex-attribute VkFormats that SPIRV-Reflect emits.
 // Only the formats produced for vertex inputs are covered; defaults to 16.
 uint32_t formatSizeBytes(VkFormat format) {
@@ -189,11 +211,18 @@ struct ReflectedInterface {
     std::vector<VkPushConstantRange> pushConstants;
     uint32_t maxColorOutputLocation = 0;   // highest fragment output location seen
     bool     hasFragmentOutputs     = false;
-    // InputAttachmentIndex values read by the fragment shader (subpassInput /
+    // Input attachments read by the fragment shader (subpassInput /
     // GENERATED_SubpassDepthFetchAttachment etc.). The render pass subpass must
     // declare a matching pInputAttachments entry for each, otherwise pipeline
     // creation reports VUID-VkGraphicsPipelineCreateInfo-renderPass-06038.
-    std::vector<uint32_t> inputAttachmentIndices;
+    // UE's depth-fetch attachment must be backed by the DEPTH attachment (a
+    // depth format + DEPTH aspect), not a color attachment.
+    struct InputAttachment {
+        uint32_t    index = 0;     // InputAttachmentIndex decoration
+        bool        isDepth = false; // depth-fetch (GENERATED_SubpassDepthFetch*)
+        std::string name;
+    };
+    std::vector<InputAttachment> inputAttachments;
     // Vertex shader input attributes (location + format), needed so the pipeline's
     // vertex input state matches what the vertex shader consumes.
     std::vector<VkVertexInputAttributeDescription> vertexAttributes;
@@ -280,11 +309,20 @@ bool reflectStage(const std::vector<uint32_t> &code, VkShaderStageFlagBits stage
             << " name=\"" << (b->name ? b->name : "") << "\"\n";
 
         // Input attachments read by the fragment shader must be backed by a
-        // matching input-attachment reference in the render pass subpass.
+        // matching input-attachment reference in the render pass subpass. UE's
+        // "GENERATED_SubpassDepthFetchAttachment" is a depth fetch and must be
+        // backed by the depth attachment (depth format + DEPTH aspect), not a
+        // color attachment.
         if (dst.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
-            out.inputAttachmentIndices.push_back(b->input_attachment_index);
-            log << "    inputAttachment index=" << b->input_attachment_index
-                << " (set=" << b->set << " binding=" << b->binding << ")\n";
+            ReflectedInterface::InputAttachment ia;
+            ia.index   = b->input_attachment_index;
+            ia.name    = b->name ? b->name : "";
+            ia.isDepth = ia.name.find("DepthFetch") != std::string::npos ||
+                         ia.name.find("SubpassDepth") != std::string::npos;
+            out.inputAttachments.push_back(ia);
+            log << "    inputAttachment index=" << ia.index
+                << " (set=" << b->set << " binding=" << b->binding << ")"
+                << (ia.isDepth ? " [depth-fetch]" : "") << "\n";
         }
     }
 
@@ -752,12 +790,12 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
         // Input attachment references are indexed by InputAttachmentIndex, so the
         // array must span [0 .. maxInputAttachmentIndex]. Gaps stay UNUSED.
         uint32_t inputRefCount = 0;
-        for (uint32_t idx : iface.inputAttachmentIndices) {
-            inputRefCount = std::max(inputRefCount, idx + 1);
+        for (const auto &ia : iface.inputAttachments) {
+            inputRefCount = std::max(inputRefCount, ia.index + 1);
         }
 
         std::vector<VkAttachmentDescription> attachments;
-        attachments.reserve(colorCount + iface.inputAttachmentIndices.size());
+        attachments.reserve(colorCount + iface.inputAttachments.size() + 1);
         std::vector<VkAttachmentReference>   colorRefs(colorCount);
         std::vector<VkAttachmentReference>   inputRefs(
                 inputRefCount, VkAttachmentReference{VK_ATTACHMENT_UNUSED,
@@ -779,34 +817,86 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
         }
         log << "color attachments: " << colorCount << "\n";
 
-        // One backing attachment per unique InputAttachmentIndex, wired into the
-        // subpass at the slot the shader expects.
-        for (uint32_t idx : iface.inputAttachmentIndices) {
-            if (idx >= inputRefs.size()) continue;                 // defensive
-            if (inputRefs[idx].attachment != VK_ATTACHMENT_UNUSED) continue; // dup
+        // The depth attachment. It is created lazily: either because the shader
+        // depth-fetches it (SubpassDepthFetch), or because we always need a valid
+        // slot for the depth-stencil reference. Its index is remembered so a
+        // depth-fetch input attachment can point at the *same* attachment (a depth
+        // attachment used simultaneously as an input attachment, exactly like UE).
+        VkAttachmentReference depthRef{VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED};
+        bool                  hasDepth = false;
+        const VkFormat        depthFormat = pickDepthStencilFormat();
+
+        auto ensureDepthAttachment = [&]() -> uint32_t {
+            if (hasDepth) return depthRef.attachment;
             VkAttachmentDescription att{};
-            att.format         = VK_FORMAT_R8G8B8A8_UNORM;
+            att.format         = depthFormat;
             att.samples        = VK_SAMPLE_COUNT_1_BIT;
             att.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
-            att.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            att.initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            att.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            inputRefs[idx].attachment = static_cast<uint32_t>(attachments.size());
-            inputRefs[idx].layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+            att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_LOAD;
+            att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+            // Depth is read (as input) and tested at the same time, so use the
+            // general depth-stencil read-only layout for both roles.
+            att.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            att.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            depthRef.attachment = static_cast<uint32_t>(attachments.size());
+            depthRef.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
             attachments.push_back(att);
+            hasDepth = true;
+            return depthRef.attachment;
+        };
+
+        // Back each InputAttachmentIndex. A depth-fetch attachment must be a depth
+        // format + DEPTH aspect and reuse the depth attachment; a regular subpass
+        // input is a plain color attachment.
+        uint32_t depthInputCount = 0;
+        uint32_t colorInputCount = 0;
+        for (const auto &ia : iface.inputAttachments) {
+            if (ia.index >= inputRefs.size()) continue;                 // defensive
+            if (inputRefs[ia.index].attachment != VK_ATTACHMENT_UNUSED) continue; // dup
+            if (ia.isDepth) {
+                uint32_t depthIdx = ensureDepthAttachment();
+                // With the classic VkAttachmentReference the input-attachment
+                // aspect is implied by the attachment format (a depth format is
+                // read through its DEPTH aspect); aspectMask only exists on
+                // VkAttachmentReference2.
+                inputRefs[ia.index].attachment = depthIdx;
+                inputRefs[ia.index].layout     =
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                ++depthInputCount;
+            } else {
+                VkAttachmentDescription att{};
+                att.format         = VK_FORMAT_R8G8B8A8_UNORM;
+                att.samples        = VK_SAMPLE_COUNT_1_BIT;
+                att.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+                att.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                att.initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                att.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                inputRefs[ia.index].attachment = static_cast<uint32_t>(attachments.size());
+                inputRefs[ia.index].layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                attachments.push_back(att);
+                ++colorInputCount;
+            }
         }
         if (inputRefCount > 0) {
-            log << "input attachments: " << inputRefCount << " ref slot(s)\n";
+            log << "input attachments: " << inputRefCount << " ref slot(s) ("
+                << depthInputCount << " depth-fetch, "
+                << colorInputCount << " color)\n";
+        }
+        if (hasDepth) {
+            log << "depth attachment: format=" << depthFormat
+                << " (also input=" << (depthInputCount > 0 ? "yes" : "no") << ")\n";
         }
 
         VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = colorCount;
-        subpass.pColorAttachments    = colorRefs.data();
-        subpass.inputAttachmentCount = inputRefCount;
-        subpass.pInputAttachments    = inputRefs.empty() ? nullptr : inputRefs.data();
+        subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount    = colorCount;
+        subpass.pColorAttachments       = colorRefs.data();
+        subpass.inputAttachmentCount    = inputRefCount;
+        subpass.pInputAttachments       = inputRefs.empty() ? nullptr : inputRefs.data();
+        subpass.pDepthStencilAttachment = hasDepth ? &depthRef : nullptr;
 
         VkRenderPassCreateInfo rpInfo{};
         rpInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -888,6 +978,17 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
         multisample.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+        // Depth/stencil state. Required whenever the subpass has a depth-stencil
+        // attachment (which it does once a depth-fetch input attachment is
+        // present). Depth test on, write off, matching UE's SubpassDepthFetch use
+        // where depth is read as an input while still being depth-tested.
+        VkPipelineDepthStencilStateCreateInfo depthStencil{};
+        depthStencil.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable  = hasDepth ? VK_TRUE : VK_FALSE;
+        depthStencil.depthWriteEnable = VK_FALSE;
+        depthStencil.depthCompareOp   = VK_COMPARE_OP_GREATER_OR_EQUAL;
+        depthStencil.stencilTestEnable = VK_FALSE;
+
         // One blend attachment per color output.
         std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(colorCount);
         for (uint32_t i = 0; i < colorCount; ++i) {
@@ -913,6 +1014,7 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
         pipelineInfo.pViewportState      = &viewportState;
         pipelineInfo.pRasterizationState = &raster;
         pipelineInfo.pMultisampleState   = &multisample;
+        pipelineInfo.pDepthStencilState  = hasDepth ? &depthStencil : nullptr;
         pipelineInfo.pColorBlendState    = &colorBlend;
         pipelineInfo.pDynamicState       = &dynamicState;
         pipelineInfo.layout              = pipelineLayout;
