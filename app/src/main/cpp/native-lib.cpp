@@ -189,6 +189,11 @@ struct ReflectedInterface {
     std::vector<VkPushConstantRange> pushConstants;
     uint32_t maxColorOutputLocation = 0;   // highest fragment output location seen
     bool     hasFragmentOutputs     = false;
+    // InputAttachmentIndex values read by the fragment shader (subpassInput /
+    // GENERATED_SubpassDepthFetchAttachment etc.). The render pass subpass must
+    // declare a matching pInputAttachments entry for each, otherwise pipeline
+    // creation reports VUID-VkGraphicsPipelineCreateInfo-renderPass-06038.
+    std::vector<uint32_t> inputAttachmentIndices;
     // Vertex shader input attributes (location + format), needed so the pipeline's
     // vertex input state matches what the vertex shader consumes.
     std::vector<VkVertexInputAttributeDescription> vertexAttributes;
@@ -273,6 +278,14 @@ bool reflectStage(const std::vector<uint32_t> &code, VkShaderStageFlagBits stage
             << " type=" << descriptorTypeName(dst.descriptorType)
             << " count=" << count
             << " name=\"" << (b->name ? b->name : "") << "\"\n";
+
+        // Input attachments read by the fragment shader must be backed by a
+        // matching input-attachment reference in the render pass subpass.
+        if (dst.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+            out.inputAttachmentIndices.push_back(b->input_attachment_index);
+            log << "    inputAttachment index=" << b->input_attachment_index
+                << " (set=" << b->set << " binding=" << b->binding << ")\n";
+        }
     }
 
     // Push constant ranges.
@@ -728,34 +741,76 @@ Java_com_zm_androidtools_VulkanContext_nativeCreateGraphicsPipeline(
         log << "vkCreatePipelineLayout OK (pushConstants="
             << iface.pushConstants.size() << ")\n";
 
-        // 6. Render pass with one color attachment per reflected fragment output.
+        // 6. Render pass with one color attachment per reflected fragment output,
+        // plus one input attachment per InputAttachmentIndex the fragment shader
+        // reads. If the shader reads a subpass input but the subpass declares no
+        // matching pInputAttachments entry, pipeline creation reports
+        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06038.
         uint32_t colorCount = iface.hasFragmentOutputs
                               ? (iface.maxColorOutputLocation + 1) : 1;
-        std::vector<VkAttachmentDescription> attachments(colorCount);
+
+        // Input attachment references are indexed by InputAttachmentIndex, so the
+        // array must span [0 .. maxInputAttachmentIndex]. Gaps stay UNUSED.
+        uint32_t inputRefCount = 0;
+        for (uint32_t idx : iface.inputAttachmentIndices) {
+            inputRefCount = std::max(inputRefCount, idx + 1);
+        }
+
+        std::vector<VkAttachmentDescription> attachments;
+        attachments.reserve(colorCount + iface.inputAttachmentIndices.size());
         std::vector<VkAttachmentReference>   colorRefs(colorCount);
+        std::vector<VkAttachmentReference>   inputRefs(
+                inputRefCount, VkAttachmentReference{VK_ATTACHMENT_UNUSED,
+                                                     VK_IMAGE_LAYOUT_UNDEFINED});
+
         for (uint32_t i = 0; i < colorCount; ++i) {
-            attachments[i] = {};
-            attachments[i].format         = VK_FORMAT_R8G8B8A8_UNORM;
-            attachments[i].samples        = VK_SAMPLE_COUNT_1_BIT;
-            attachments[i].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachments[i].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-            attachments[i].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachments[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachments[i].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-            attachments[i].finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            colorRefs[i].attachment = i;
+            VkAttachmentDescription att{};
+            att.format         = VK_FORMAT_R8G8B8A8_UNORM;
+            att.samples        = VK_SAMPLE_COUNT_1_BIT;
+            att.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+            att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+            att.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorRefs[i].attachment = static_cast<uint32_t>(attachments.size());
             colorRefs[i].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            attachments.push_back(att);
         }
         log << "color attachments: " << colorCount << "\n";
+
+        // One backing attachment per unique InputAttachmentIndex, wired into the
+        // subpass at the slot the shader expects.
+        for (uint32_t idx : iface.inputAttachmentIndices) {
+            if (idx >= inputRefs.size()) continue;                 // defensive
+            if (inputRefs[idx].attachment != VK_ATTACHMENT_UNUSED) continue; // dup
+            VkAttachmentDescription att{};
+            att.format         = VK_FORMAT_R8G8B8A8_UNORM;
+            att.samples        = VK_SAMPLE_COUNT_1_BIT;
+            att.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+            att.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att.initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            att.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            inputRefs[idx].attachment = static_cast<uint32_t>(attachments.size());
+            inputRefs[idx].layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            attachments.push_back(att);
+        }
+        if (inputRefCount > 0) {
+            log << "input attachments: " << inputRefCount << " ref slot(s)\n";
+        }
 
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = colorCount;
         subpass.pColorAttachments    = colorRefs.data();
+        subpass.inputAttachmentCount = inputRefCount;
+        subpass.pInputAttachments    = inputRefs.empty() ? nullptr : inputRefs.data();
 
         VkRenderPassCreateInfo rpInfo{};
         rpInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpInfo.attachmentCount = colorCount;
+        rpInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
         rpInfo.pAttachments    = attachments.data();
         rpInfo.subpassCount    = 1;
         rpInfo.pSubpasses      = &subpass;

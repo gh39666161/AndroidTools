@@ -6,6 +6,10 @@ android {
     namespace 'com.zm.androidtools'
     compileSdk 36
 
+    // NDK r27+ links native libraries with 16 KB page alignment by default,
+    // which is required for Android 15+ (16 KB page size) devices.
+    ndkVersion '27.3.13750724'
+
     defaultConfig {
         applicationId "com.zm.androidtools"
         minSdk 24
@@ -14,6 +18,13 @@ android {
         versionName "1.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                // Force 16 KB ELF LOAD segment alignment for all shared libraries.
+                arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+            }
+        }
     }
 
     buildTypes {

@@ -1,6 +1,9 @@
 package com.zm.androidtools;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import android.os.Bundle;
 import android.util.Log;
@@ -36,6 +39,18 @@ public class MainActivity extends AppCompatActivity {
 
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+
+        // targetSdk 35+ forces edge-to-edge, so content draws under the status
+        // and navigation bars. In landscape the gesture/cutout insets also land
+        // on the sides. Consume the system bar + cutout insets as root padding so
+        // the log area and button bar stay clear of the system UI.
+        ViewCompat.setOnApplyWindowInsetsListener(binding.rootLayout, (view, windowInsets) -> {
+            Insets bars = windowInsets.getInsets(
+                    WindowInsetsCompat.Type.systemBars()
+                            | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
 
         binding.btnCompileShader.setOnClickListener(new View.OnClickListener() {
             @Override

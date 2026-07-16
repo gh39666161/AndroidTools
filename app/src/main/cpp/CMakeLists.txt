@@ -41,3 +41,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         android
         log
         vulkan)
+
+# Ensure ELF LOAD segments are aligned to 16 KB so the library loads on
+# Android 15+ devices that use a 16 KB memory page size. NDK r27+ does this
+# by default, but the explicit flag keeps older toolchains compatible too.
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+        "-Wl,-z,max-page-size=16384")
