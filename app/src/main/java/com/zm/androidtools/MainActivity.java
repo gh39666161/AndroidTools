@@ -31,6 +31,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String SPV_VERT_ASSET_NAME = "MobileBasePassVertexShader.spv";
     private static final String SPV_FRAG_ASSET_NAME = "MobileBasePassPixelShader.spv";
 
+    private static final String GLES_VERT_ASSET_NAME = "MobileBasePassVertexShader.vert";
+    private static final String GLES_FRAG_ASSET_NAME = "MobileBasePassPixelShader.frag";
+
     private ActivityMainBinding binding;
 
     @Override
@@ -126,7 +129,7 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
             try {
-                String shaderSource = readAssetText("Output.vert");
+                String shaderSource = readAssetText(GLES_VERT_ASSET_NAME);
                 ShaderCompileResult vertResult = gles3.compileShader(shaderSource, ShaderFrequence.VertexShader);
                 appendLog(logStrBuilder, "Compile vertex shader result:\n" + vertResult.result);
                 if (!vertResult.bSuccess)
@@ -135,7 +138,7 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                shaderSource = readAssetText("Output.frag");
+                shaderSource = readAssetText(GLES_FRAG_ASSET_NAME);
                 ShaderCompileResult fragResult = gles3.compileShader(shaderSource, ShaderFrequence.PixelShader);
                 appendLog(logStrBuilder, "Compile frag shader result:\n" + fragResult.result);
                 if (!fragResult.bSuccess)
